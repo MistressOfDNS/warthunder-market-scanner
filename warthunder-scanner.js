@@ -14,8 +14,14 @@
 
   const STORAGE_KEY = "gaijin-market-price-watch:v2";
   const TOKEN_STORAGE_KEY = "MarketApp,auth,tokenPair";
-  const NORMAL_PRICE_COEFF = 10000;
-  const HISTORY_LIMIT = 120;
+  const OLD_PRICE_COEFF = 10000;
+  const NORMAL_PRICE_COEFF = 100000000;
+  const SETTINGS_VERSION = 2;
+  const OLD_DEFAULT_MIN_ALERT_PRICE = 5000;
+  const DEFAULT_MIN_ALERT_PRICE_GJN = 2;
+  const DEFAULT_MIN_ALERT_PRICE = DEFAULT_MIN_ALERT_PRICE_GJN * NORMAL_PRICE_COEFF;
+  const HISTORY_LIMIT = 40;
+  const HISTORY_COMPACT_LIMIT = 12;
   const DEFAULT_LANGUAGE = "en_US";
   const DEFAULT_CIRCUITS = {
     trade_server: "https://market-proxy.gaijin.net/web",
@@ -24,6 +30,11 @@
     enabled: true,
     thresholdPercent: 25,
     minSamples: 6,
+    minSamplesBypassPrice: 0,
+    minAlertPrice: DEFAULT_MIN_ALERT_PRICE,
+    minAlertPriceTouched: false,
+    hideTrophies: false,
+    settingsVersion: SETTINGS_VERSION,
     refreshIntervalMs: 30000,
     sampleCooldownMs: 10 * 60 * 1000,
     notifyCooldownMs: 30 * 60 * 1000,
@@ -36,8 +47,10 @@
   let circuitsPromise = null;
   let marketInfoPromise = null;
   let lastSearchRequest = null;
+  let currentDeal = null;
   let pollInFlight = false;
 
+  compactStoredState();
   ensurePanel();
   requestNotificationPermissionIfNeeded();
   installNetworkHooks();
@@ -51,8 +64,9 @@
       }
 
       const parsed = JSON.parse(raw);
+      const settings = migrateSettings({ ...DEFAULT_SETTINGS, ...(parsed.settings || {}) }, parsed.settings || {});
       return {
-        settings: { ...DEFAULT_SETTINGS, ...(parsed.settings || {}) },
+        settings,
         history: parsed.history || {},
         lastNotifications: parsed.lastNotifications || {},
         lastSeenPrices: parsed.lastSeenPrices || {},
@@ -81,7 +95,62 @@
   }
 
   function saveState() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch (error) {
+      compactStoredState();
+
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        updateStatus("Storage was full, compacted saved price history.");
+      } catch (retryError) {
+        console.warn("Gaijin watcher: failed to save state.", retryError);
+        updateStatus("Storage full: current scan still works, but history could not be saved.");
+      }
+    }
+  }
+
+  function migrateSettings(settings, savedSettings) {
+    if ((savedSettings.settingsVersion || 1) < SETTINGS_VERSION) {
+      settings.minAlertPrice = migratePriceSetting(savedSettings.minAlertPrice, settings.minAlertPrice);
+      settings.minSamplesBypassPrice = migratePriceSetting(
+        savedSettings.minSamplesBypassPrice,
+        settings.minSamplesBypassPrice
+      );
+    }
+
+    if (
+      !savedSettings.minAlertPriceTouched &&
+      settings.minAlertPrice <= OLD_DEFAULT_MIN_ALERT_PRICE * (NORMAL_PRICE_COEFF / OLD_PRICE_COEFF)
+    ) {
+      settings.minAlertPrice = DEFAULT_MIN_ALERT_PRICE;
+    }
+
+    settings.settingsVersion = SETTINGS_VERSION;
+    return settings;
+  }
+
+  function migratePriceSetting(value, fallback) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return fallback;
+    }
+
+    return Math.round(parsed * (NORMAL_PRICE_COEFF / OLD_PRICE_COEFF));
+  }
+
+  function compactStoredState() {
+    for (const [key, history] of Object.entries(state.history)) {
+      const normalized = normalizeHistory(history);
+      if (!normalized.length) {
+        delete state.history[key];
+        delete state.lastSeenPrices[key];
+        delete state.lastNotifications[key];
+        continue;
+      }
+
+      state.history[key] = normalized.slice(-HISTORY_COMPACT_LIMIT);
+    }
   }
 
   function startWatching() {
@@ -147,6 +216,8 @@
   }
 
   function processItems(items) {
+    updateTrophyVisibility(items);
+
     if (!items.length) {
       renderStats([]);
       saveState();
@@ -156,23 +227,32 @@
     const interesting = [];
 
     for (const item of items) {
+      if (state.settings.hideTrophies && isTrophyItem(item)) {
+        continue;
+      }
+
       const history = normalizeHistory(state.history[item.key] || []);
-      const baseline = median(history.map((entry) => entry.price));
+      const historyPrices = history.map((entry) => entry.price);
+      const baseline = median(historyPrices);
+      const averagePrice = average(historyPrices);
       const samples = history.length;
       const thresholdMultiplier = 1 - state.settings.thresholdPercent / 100;
 
       maybeStoreSample(item, history);
 
       if (
-        samples >= state.settings.minSamples &&
+        hasEnoughSamples(item, samples) &&
         baseline > 0 &&
+        item.price >= state.settings.minAlertPrice &&
         item.price <= baseline * thresholdMultiplier
       ) {
         const discountPercent = (1 - item.price / baseline) * 100;
-        const candidate = { ...item, baseline, samples, discountPercent };
+        const candidate = { ...item, averagePrice, baseline, samples, discountPercent };
         interesting.push(candidate);
         highlightItemCard(item);
-        maybeNotify(candidate);
+        if (maybeNotify(candidate)) {
+          renderDeal(candidate);
+        }
       }
     }
 
@@ -197,18 +277,31 @@
     state.lastSeenPrices[item.key] = { price: item.price, ts: now };
   }
 
+  function hasEnoughSamples(item, samples) {
+    if (samples >= state.settings.minSamples) {
+      return true;
+    }
+
+    return (
+      state.settings.minSamplesBypassPrice > 0 &&
+      item.price >= state.settings.minSamplesBypassPrice &&
+      samples > 0
+    );
+  }
+
   function maybeNotify(item) {
     const now = Date.now();
     const last = state.lastNotifications[item.key] || 0;
 
     if (now - last < state.settings.notifyCooldownMs) {
-      return;
+      return false;
     }
 
     const title = "Gaijin Market deal spotted";
     const body =
       `${item.name}\n` +
-      `Now: ${formatMoney(item.price)}\n` +
+      `Deal: ${formatMoney(item.price)}\n` +
+      `Average: ${formatMoney(item.averagePrice)}\n` +
       `Normal: ${formatMoney(item.baseline)}\n` +
       `Drop: ${item.discountPercent.toFixed(1)}%`;
 
@@ -219,6 +312,7 @@
     playChime();
     state.lastNotifications[item.key] = now;
     updateStatus(`Alert: ${item.name} is ${item.discountPercent.toFixed(1)}% below baseline.`);
+    return true;
   }
 
   function installNetworkHooks() {
@@ -553,16 +647,20 @@
       : sorted[middle];
   }
 
+  function average(values) {
+    if (!values.length) {
+      return 0;
+    }
+
+    return values.reduce((total, value) => total + value, 0) / values.length;
+  }
+
   function formatMoney(value) {
     if (!Number.isFinite(value)) {
       return "";
     }
 
-    const rounded = String(Math.round(value) + 99);
-    const sign = rounded.startsWith("-") ? "-" : "";
-    const digits = sign ? rounded.slice(1) : rounded;
-    const padded = digits.length <= 4 ? (`0000${digits}`).slice(-5) : digits;
-    return `${sign}${padded.slice(0, padded.length - 4)}.${padded.slice(-4, -2)} GJN`;
+    return `${(value / NORMAL_PRICE_COEFF).toFixed(2)} GJN`;
   }
 
   function playChime() {
@@ -612,6 +710,61 @@
     }
   }
 
+  function updateTrophyVisibility(items) {
+    restoreHiddenTrophyCards();
+
+    if (!state.settings.hideTrophies) {
+      return;
+    }
+
+    for (const item of items) {
+      if (!isTrophyItem(item)) {
+        continue;
+      }
+
+      const card = findItemCard(item);
+      if (!card) {
+        continue;
+      }
+
+      card.dataset.gpwHiddenTrophy = "true";
+      card.style.display = "none";
+    }
+  }
+
+  function restoreHiddenTrophyCards() {
+    for (const card of document.querySelectorAll("[data-gpw-hidden-trophy='true']")) {
+      if (!(card instanceof HTMLElement)) {
+        continue;
+      }
+
+      card.style.display = "";
+      delete card.dataset.gpwHiddenTrophy;
+    }
+  }
+
+  function isTrophyItem(item) {
+    return `${item.name || ""} ${item.hashName || ""}`.toLowerCase().includes("trophy");
+  }
+
+  function findItemCard(item) {
+    const selectors = Array.from(document.querySelectorAll(`a[href*="/market/${item.appid}/"]`));
+
+    for (const anchor of selectors) {
+      const href = anchor.getAttribute("href") || "";
+      if (!href.includes(encodeURIComponent(item.hashName))) {
+        continue;
+      }
+
+      const card = anchor.closest(".lot") || anchor;
+      if (card instanceof HTMLElement) {
+        return card;
+      }
+    }
+
+    return null;
+  }
+
   function requestNotificationPermissionIfNeeded() {
     if (!("Notification" in window)) {
       updateStatus("Browser notifications are not available here.");
@@ -652,11 +805,24 @@
           <input id="gpw-samples" type="number" min="1" max="100" step="1" />
         </label>
         <label>
+          Bypass samples GJN
+          <input id="gpw-sample-bypass-price" type="number" min="0" max="100000" step="0.01" />
+        </label>
+        <label>
+          Min price GJN
+          <input id="gpw-min-price" type="number" min="0" max="10000" step="0.01" />
+        </label>
+        <label>
+          Hide trophies
+          <input id="gpw-hide-trophies" type="checkbox" />
+        </label>
+        <label>
           Refresh sec
           <input id="gpw-refresh" type="number" min="5" max="600" step="5" />
         </label>
         <div id="gpw-actions">
           <button id="gpw-scan" type="button">Scan now</button>
+          <button id="gpw-open-deal" type="button" disabled>Open deal</button>
           <button id="gpw-reset" type="button">Reset history</button>
         </div>
         <div id="gpw-stats"></div>
@@ -755,6 +921,14 @@
 
       #gaijin-price-watch-panel input[type="number"] {
         width: 72px;
+        appearance: textfield;
+        -moz-appearance: textfield;
+      }
+
+      #gaijin-price-watch-panel input[type="number"]::-webkit-outer-spin-button,
+      #gaijin-price-watch-panel input[type="number"]::-webkit-inner-spin-button {
+        -webkit-appearance: none;
+        margin: 0;
       }
 
       #gaijin-price-watch-panel input,
@@ -798,8 +972,12 @@
       enabled: panel.querySelector("#gpw-enabled"),
       threshold: panel.querySelector("#gpw-threshold"),
       samples: panel.querySelector("#gpw-samples"),
+      sampleBypassPrice: panel.querySelector("#gpw-sample-bypass-price"),
+      minPrice: panel.querySelector("#gpw-min-price"),
+      hideTrophies: panel.querySelector("#gpw-hide-trophies"),
       refresh: panel.querySelector("#gpw-refresh"),
       scan: panel.querySelector("#gpw-scan"),
+      openDeal: panel.querySelector("#gpw-open-deal"),
       reset: panel.querySelector("#gpw-reset"),
       stats: panel.querySelector("#gpw-stats"),
       status: panel.querySelector("#gpw-status"),
@@ -808,6 +986,9 @@
     panelRefs.enabled.checked = state.settings.enabled;
     panelRefs.threshold.value = String(state.settings.thresholdPercent);
     panelRefs.samples.value = String(state.settings.minSamples);
+    panelRefs.sampleBypassPrice.value = formatGjnInput(state.settings.minSamplesBypassPrice);
+    panelRefs.minPrice.value = formatGjnInput(state.settings.minAlertPrice);
+    panelRefs.hideTrophies.checked = state.settings.hideTrophies;
     panelRefs.refresh.value = String(Math.round(state.settings.refreshIntervalMs / 1000));
     syncPanelVisibility();
     updatePanelScale();
@@ -844,6 +1025,30 @@
       runPoll("settings");
     });
 
+    panelRefs.sampleBypassPrice.addEventListener("change", () => {
+      state.settings.minSamplesBypassPrice = parseGjnInput(panelRefs.sampleBypassPrice.value, 0, 100000, 0);
+      panelRefs.sampleBypassPrice.value = formatGjnInput(state.settings.minSamplesBypassPrice);
+      saveState();
+      runPoll("settings");
+    });
+
+    panelRefs.minPrice.addEventListener("change", () => {
+      state.settings.minAlertPrice = parseGjnInput(panelRefs.minPrice.value, 0, 10000, DEFAULT_MIN_ALERT_PRICE_GJN);
+      state.settings.minAlertPriceTouched = true;
+      panelRefs.minPrice.value = formatGjnInput(state.settings.minAlertPrice);
+      saveState();
+      runPoll("settings");
+    });
+
+    panelRefs.hideTrophies.addEventListener("change", () => {
+      state.settings.hideTrophies = panelRefs.hideTrophies.checked;
+      saveState();
+      if (!state.settings.hideTrophies) {
+        restoreHiddenTrophyCards();
+      }
+      runPoll("settings");
+    });
+
     panelRefs.refresh.addEventListener("change", () => {
       const seconds = clampNumber(panelRefs.refresh.value, 5, 600, 30);
       state.settings.refreshIntervalMs = seconds * 1000;
@@ -854,10 +1059,19 @@
     });
 
     panelRefs.scan.addEventListener("click", () => runPoll("manual"));
+    panelRefs.openDeal.addEventListener("click", () => {
+      if (!currentDeal) {
+        return;
+      }
+
+      window.open(getItemUrl(currentDeal), "_blank", "noopener");
+    });
+
     panelRefs.reset.addEventListener("click", () => {
       state.history = {};
       state.lastNotifications = {};
       state.lastSeenPrices = {};
+      currentDeal = null;
       saveState();
       renderStats([]);
       updateStatus("Saved history cleared.");
@@ -871,6 +1085,18 @@
     }
 
     return Math.max(min, Math.min(max, parsed));
+  }
+
+  function parseGjnInput(value, min, max, fallback) {
+    const parsed = Number.parseFloat(value);
+    const normalized = Number.isFinite(parsed) ? parsed : fallback;
+    const clamped = Math.max(min, Math.min(max, normalized));
+    return Math.round(clamped * NORMAL_PRICE_COEFF);
+  }
+
+  function formatGjnInput(value) {
+    const amount = Number(value || 0) / NORMAL_PRICE_COEFF;
+    return amount.toFixed(2);
   }
 
   function parseInteger(value, fallback) {
@@ -889,13 +1115,50 @@
 
     const tracked = Object.keys(state.history).length;
     if (!interesting.length) {
-      panelRefs.stats.textContent = `Tracking ${tracked} item${tracked === 1 ? "" : "s"}. No deal right now.`;
+      if (currentDeal) {
+        renderDeal(currentDeal);
+        return;
+      }
+
+      renderNoDeal(tracked);
       return;
     }
 
-    const best = interesting.sort((a, b) => b.discountPercent - a.discountPercent)[0];
+    if (!currentDeal) {
+      renderNoDeal(tracked);
+    }
+  }
+
+  function renderDeal(deal) {
+    if (!panelRefs) {
+      return;
+    }
+
+    const tracked = Object.keys(state.history).length;
+    currentDeal = deal;
+    panelRefs.openDeal.disabled = false;
     panelRefs.stats.textContent =
-      `Tracking ${tracked} items. Best deal: ${best.name} at ${best.discountPercent.toFixed(1)}% below baseline.`;
+      `Tracking ${tracked} items. Last deal: ${deal.name}. ` +
+      `Deal: ${formatMoney(deal.price)}. Average: ${formatMoney(deal.averagePrice)}. ` +
+      `Drop: ${deal.discountPercent.toFixed(1)}% below baseline.`;
+  }
+
+  function renderNoDeal(tracked) {
+    currentDeal = null;
+    panelRefs.openDeal.disabled = true;
+    panelRefs.stats.textContent = `Tracking ${tracked} item${tracked === 1 ? "" : "s"}. No deal right now.`;
+  }
+
+  function getItemUrl(item) {
+    const card = findItemCard(item);
+    const anchor = card?.closest?.("a") || card?.querySelector?.("a");
+    const href = anchor?.getAttribute?.("href");
+
+    if (href) {
+      return new URL(href, location.origin).href;
+    }
+
+    return `${location.origin}/market/${item.appid}/${encodeURIComponent(item.hashName)}`;
   }
 
   function updateStatus(message) {
