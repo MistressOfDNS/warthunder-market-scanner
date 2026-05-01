@@ -3,11 +3,17 @@
 // @namespace    warthunder-tools
 // @version      2.0.0
 // @description  Watches the current Gaijin market sell/buy/auction view and notifies when an item drops far below its usual observed price.
+// @homepage     https://github.com/Zitrone30/warthunder-market-scanner
+// @homepageURL  https://github.com/Zitrone30/warthunder-market-scanner
+// @supportURL   https://github.com/Zitrone30/warthunder-market-scanner/issues
+// @downloadURL  https://raw.githubusercontent.com/Zitrone30/warthunder-market-scanner/refs/heads/main/warthunder-scanner.js
+// @updateURL    https://raw.githubusercontent.com/Zitrone30/warthunder-market-scanner/refs/heads/main/warthunder-scanner.js
 // @match        https://trade.gaijin.net/market/*
 // @grant        none
+// @license      AGPL-3.0-only
+// @author       DNS/Marie
 // ==/UserScript==
 
-// Made by DNS/Marie
 
 (function () {
   "use strict";
